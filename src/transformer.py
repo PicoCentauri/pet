@@ -84,8 +84,10 @@ class Transformer(torch.nn.Module):
     def __init__(self, trans_layer, num_layers):
         super(Transformer, self).__init__()
         self.transformer_type = trans_layer.transformer_type
-        if trans_layer.transformer_type == 'PreLN':
-            self.final_norm = nn.LayerNorm(trans_layer.d_model)
+        
+        # only used if the transformer type is PreLN
+        self.final_norm = nn.LayerNorm(trans_layer.d_model)
+        
         self.layers = [copy.deepcopy(trans_layer) for _ in range(num_layers)]
         self.layers = nn.ModuleList(self.layers)
 
