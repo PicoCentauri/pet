@@ -274,6 +274,7 @@ class CentralSpecificModel(torch.nn.Module):
         result = self.uniter(result, central_indices)
         return result
         
+        
 class Head(torch.nn.Module):
     def __init__(self, hypers, n_in, n_neurons):
         super(Head, self).__init__()  
@@ -281,11 +282,58 @@ class Head(torch.nn.Module):
         self.nn = nn.Sequential(nn.Linear(n_in, n_neurons), get_activation(hypers),
                                     nn.Linear(n_neurons, n_neurons), get_activation(hypers),
                                     nn.Linear(n_neurons, hypers.D_OUTPUT))
-       
+    
     def forward(self, batch_dict : Dict[str, torch.Tensor]):
         pooled = batch_dict['pooled']
         outputs = self.nn(pooled)
         return {"atomic_predictions" : outputs}
+    
+class CentralTokensPredictor(torch.nn.Module):
+    def __init__(self, hypers, head):
+        super(CentralTokensPredictor, self).__init__()  
+        self.head = head
+        self.hypers = hypers
+
+    def forward(self, central_tokens: torch.Tensor, central_species : torch.Tensor):
+        predictions = self.head({'pooled' : central_tokens, 
+                                     'central_species' : central_species})['atomic_predictions']
+        return predictions
+
+class MessagesPredictor(torch.nn.Module):
+    def __init__(self, hypers, head):
+        super(MessagesPredictor, self).__init__()
+        self.head = head
+        self.AVERAGE_POOLING = hypers.AVERAGE_POOLING
+
+    def forward(self, messages: torch.Tensor, mask: torch.Tensor, nums: torch.Tensor,
+                 central_species: torch.Tensor, multipliers : torch.Tensor):
+        messages_proceed = messages * multipliers[:, :, None]
+        messages_proceed[mask] = 0.0
+        if self.AVERAGE_POOLING:
+            pooled = messages_proceed.sum(dim = 1) / nums[:, None]
+        else:
+            pooled = messages_proceed.sum(dim = 1)
+        
+        predictions = self.head({'pooled' : pooled, 
+                                     'central_species' : central_species})['atomic_predictions']
+        return predictions
+    
+class MessagesBondsPredictor(torch.nn.Module):
+    def __init__(self, hypers, head):
+        super(MessagesBondsPredictor, self).__init__()
+        self.head = head
+        self.AVERAGE_BOND_ENERGIES = hypers.AVERAGE_BOND_ENERGIES
+
+    def forward(self, messages: torch.Tensor, mask: torch.Tensor, nums: torch.Tensor,
+                 central_species: torch.Tensor):
+        predictions = self.head({'pooled' : messages, 
+                                     'central_species' : central_species})['atomic_predictions']
+        predictions[mask] = 0.0
+        if self.AVERAGE_BOND_ENERGIES:
+            result = predictions.sum(dim = 1) / nums
+        else:
+            result = predictions.sum(dim = 1)
+        return result
     
 class PET(torch.nn.Module):
     def __init__(self, hypers, transformer_dropout, n_atomic_species, 
@@ -351,7 +399,8 @@ class PET(torch.nn.Module):
                 heads.append(Head(hypers, transformer_d_model, head_n_neurons))
         
         self.heads = torch.nn.ModuleList(heads)
-        
+        self.central_tokens_predictors = torch.nn.ModuleList([CentralTokensPredictor(hypers, head) for head in heads])
+        self.messages_predictors = torch.nn.ModuleList([MessagesPredictor(hypers, head) for head in heads])
         
         if hypers.USE_BOND_ENERGIES:
             bond_heads = []
@@ -368,42 +417,14 @@ class PET(torch.nn.Module):
                     bond_heads.append(Head(hypers, transformer_d_model, head_n_neurons))
 
             self.bond_heads = torch.nn.ModuleList(bond_heads)
-
-
+            self.messages_bonds_predictors = torch.nn.ModuleList([MessagesBondsPredictor(hypers, head) for head in bond_heads])
+        
         self.R_CUT = hypers.R_CUT
         self.CUTOFF_DELTA = hypers.CUTOFF_DELTA
         self.USE_BOND_ENERGIES = hypers.USE_BOND_ENERGIES
         self.TARGET_TYPE = hypers.TARGET_TYPE
         self.TARGET_AGGREGATION = hypers.TARGET_AGGREGATION
         self.N_GNN_LAYERS = hypers.N_GNN_LAYERS
-
-    def get_predictions_messages(self, messages, mask, nums, head, central_species, multipliers):
-        #print(multipliers[0, :])
-        messages_proceed = messages * multipliers[:, :, None]
-        messages_proceed[mask] = 0.0
-        if self.hypers.AVERAGE_POOLING:
-            pooled = messages_proceed.sum(dim = 1) / nums[:, None]
-        else:
-            pooled = messages_proceed.sum(dim = 1)
-        
-        predictions = head({'pooled' : pooled, 
-                                     'central_species' : central_species})['atomic_predictions']
-        return predictions
-    
-    def get_predictions_messages_bonds(self, messages, mask, nums, head, central_species):
-        predictions = head({'pooled' : messages, 
-                                     'central_species' : central_species})['atomic_predictions']
-        predictions[mask] = 0.0
-        if self.hypers.AVERAGE_BOND_ENERGIES:
-            result = predictions.sum(dim = 1) / nums
-        else:
-            result = predictions.sum(dim = 1)
-        return result
-    
-    def get_predictions_central_tokens(self, central_tokens: torch.Tensor, head: torch.nn.Module, central_species):
-        predictions = head({'pooled' : central_tokens, 
-                                     'central_species' : central_species})['atomic_predictions']
-        return predictions
         
     def get_predictions(self, batch_dict : Dict[str, torch.Tensor]):
         
@@ -421,9 +442,9 @@ class PET(torch.nn.Module):
         neighbors_pos = batch_dict['neighbors_pos']
         
         batch_dict['input_messages'] = self.embedding(neighbor_species)
-        atomic_predictions = 0.0
+        atomic_predictions = torch.FloatTensor([0]).to(x.device)
         
-        for layer_index, (head, gnn_layer, bond_head) in enumerate(zip(self.heads, self.gnn_layers, self.bond_heads)):
+        for layer_index, (central_tokens_predictor, messages_predictor, gnn_layer, messages_bonds_predictor) in enumerate(zip(self.central_tokens_predictors, self.messages_predictors, self.gnn_layers, self.messages_bonds_predictors)):
                 
             result = gnn_layer(batch_dict)
             output_messages = result["output_messages"]
@@ -433,14 +454,17 @@ class PET(torch.nn.Module):
             batch_dict['input_messages'] = 0.5 * (batch_dict['input_messages'] + new_input_messages)
             
             if "central_token" in result.keys():
-                atomic_predictions = atomic_predictions + self.get_predictions_central_tokens(result["central_token"],
-                                                                                       head, central_species)
+                #atomic_predictions = atomic_predictions + self.get_predictions_central_tokens(result["central_token"],
+                #                                                                       head, central_species)
+
+                atomic_predictions = atomic_predictions + central_tokens_predictor(result["central_token"], central_species)
             else:
-                 atomic_predictions = atomic_predictions + self.get_predictions_messages(output_messages, mask, nums, head, central_species, multipliers)
-                    
+                #atomic_predictions = atomic_predictions + self.get_predictions_messages(output_messages, mask, nums, head, central_species, multipliers)
+                atomic_predictions = atomic_predictions + messages_predictor(output_messages, mask, nums, central_species, multipliers)   
             if self.USE_BOND_ENERGIES:
-                atomic_predictions = atomic_predictions + self.get_predictions_messages_bonds(output_messages,
-                                                                                    mask, nums, bond_head, central_species)
+                #atomic_predictions = atomic_predictions + self.get_predictions_messages_bonds(output_messages,
+                #                                                                    mask, nums, bond_head, central_species)
+                atomic_predictions = atomic_predictions + messages_bonds_predictor(output_messages, mask, nums, central_species)
        
         if self.TARGET_TYPE == 'structural':
             if self.TARGET_AGGREGATION == 'sum':
@@ -458,7 +482,7 @@ class PET(torch.nn.Module):
         if rotations is not None:
             x_initial = batch_dict['x']
             batch_dict['x'] = torch.bmm(x_initial, rotations)
-            predictions = self.get_predictions(batch)
+            predictions = self.get_predictions(batch_dict)
             batch_dict['x'] = x_initial
             return predictions
         else:
